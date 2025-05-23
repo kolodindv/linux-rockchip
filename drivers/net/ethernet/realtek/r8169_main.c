@@ -287,6 +287,7 @@ enum rtl8168_8101_registers {
 };
 
 enum rtl8168_registers {
+        LED_CTRL		= 0x18,
 	LED_FREQ		= 0x1a,
 	EEE_LED			= 0x1b,
 	ERIDR			= 0x70,
@@ -328,12 +329,22 @@ enum rtl8168_registers {
 };
 
 enum rtl8125_registers {
+	LEDSEL0			= 0x18,
+	INT_CFG0_8125		= 0x34,
+#define INT_CFG0_ENABLE_8125		BIT(0)
+#define INT_CFG0_CLKREQEN		BIT(3)
 	IntrMask_8125		= 0x38,
 	IntrStatus_8125		= 0x3c,
+	INT_CFG1_8125		= 0x7a,
+	LEDSEL2			= 0x84,
+	LEDSEL1			= 0x86,
 	TxPoll_8125		= 0x90,
+	LEDSEL3			= 0x96,
 	MAC0_BKP		= 0x19e0,
 	EEE_TXIDLE_TIMER_8125	= 0x6048,
 };
+
+#define LEDSEL_MASK_8125	0x23f
 
 #define RX_VLAN_INNER_8125	BIT(22)
 #define RX_VLAN_OUTER_8125	BIT(23)
@@ -616,6 +627,8 @@ struct rtl8169_private {
 		struct work_struct work;
 	} wk;
 
+        struct mutex led_lock;	/* serialize LED ctrl RMW access */
+
 	unsigned supports_gmii:1;
 	unsigned aspm_manageable:1;
 	unsigned dash_enabled:1;
@@ -627,6 +640,8 @@ struct rtl8169_private {
 
 	const char *fw_name;
 	struct rtl_fw *rtl_fw;
+
+        struct r8169_led_classdev *leds;
 
 	u32 ocp_base;
 };
@@ -751,6 +766,107 @@ static const struct rtl_cond name = {			\
 };							\
 							\
 static bool name ## _check(struct rtl8169_private *tp)
+
+int rtl8168_led_mod_ctrl(struct rtl8169_private *tp, u16 mask, u16 val)
+{
+	struct device *dev = tp_to_dev(tp);
+	int ret;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&tp->led_lock);
+	RTL_W16(tp, LED_CTRL, (RTL_R16(tp, LED_CTRL) & ~mask) | val);
+	mutex_unlock(&tp->led_lock);
+
+	pm_runtime_put_sync(dev);
+
+	return 0;
+}
+
+int rtl8168_get_led_mode(struct rtl8169_private *tp)
+{
+	struct device *dev = tp_to_dev(tp);
+	int ret;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+
+	ret = RTL_R16(tp, LED_CTRL);
+
+	pm_runtime_put_sync(dev);
+
+	return ret;
+}
+
+static int rtl8125_get_led_reg(int index)
+{
+	static const int led_regs[] = { LEDSEL0, LEDSEL1, LEDSEL2, LEDSEL3 };
+
+	return led_regs[index];
+}
+
+int rtl8125_set_led_mode(struct rtl8169_private *tp, int index, u16 mode)
+{
+	int reg = rtl8125_get_led_reg(index);
+	struct device *dev = tp_to_dev(tp);
+	int ret;
+	u16 val;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&tp->led_lock);
+	val = RTL_R16(tp, reg) & ~LEDSEL_MASK_8125;
+	RTL_W16(tp, reg, val | mode);
+	mutex_unlock(&tp->led_lock);
+
+	pm_runtime_put_sync(dev);
+
+	return 0;
+}
+
+int rtl8125_get_led_mode(struct rtl8169_private *tp, int index)
+{
+	int reg = rtl8125_get_led_reg(index);
+	struct device *dev = tp_to_dev(tp);
+	int ret;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+
+	ret = RTL_R16(tp, reg);
+
+	pm_runtime_put_sync(dev);
+
+	return ret;
+}
+
+void r8169_get_led_name(struct rtl8169_private *tp, int idx,
+			char *buf, int buf_len)
+{
+	struct pci_dev *pdev = tp->pci_dev;
+	char pdom[8], pfun[8];
+	int domain;
+
+	domain = pci_domain_nr(pdev->bus);
+	if (domain)
+		snprintf(pdom, sizeof(pdom), "P%d", domain);
+	else
+		pdom[0] = '\0';
+
+	if (pdev->multifunction)
+		snprintf(pfun, sizeof(pfun), "f%d", PCI_FUNC(pdev->devfn));
+	else
+		pfun[0] = '\0';
+
+	snprintf(buf, buf_len, "en%sp%ds%d%s-%d::lan", pdom, pdev->bus->number,
+		 PCI_SLOT(pdev->devfn), pfun, idx);
+}
 
 static void r8168fp_adjust_ocp_cmd(struct rtl8169_private *tp, u32 *cmd, int type)
 {
@@ -5200,6 +5316,7 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	tp->supports_gmii = ent->driver_data == RTL_CFG_NO_GBIT ? 0 : 1;
 	tp->eee_adv = -1;
 	tp->ocp_base = OCP_STD_PHY_BASE;
+        mutex_init(&tp->led_lock);
 
 	dev->tstats = devm_netdev_alloc_pcpu_stats(&pdev->dev,
 						   struct pcpu_sw_netstats);
@@ -5357,6 +5474,13 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	rc = register_netdev(dev);
 	if (rc)
 		return rc;
+
+	if (IS_ENABLED(CONFIG_R8169_LEDS)) {
+		if (rtl_is_8125(tp))
+			tp->leds = rtl8125_init_leds(dev);
+		else if (tp->mac_version > RTL_GIGA_MAC_VER_06)
+			tp->leds = rtl8168_init_leds(dev);
+	}
 
 	netdev_info(dev, "%s, %pM, XID %03x, IRQ %d\n",
 		    rtl_chip_infos[chipset].name, dev->dev_addr, xid, tp->irq);
