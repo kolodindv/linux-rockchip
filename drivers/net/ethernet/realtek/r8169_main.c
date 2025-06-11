@@ -28,7 +28,7 @@
 #include <linux/bitfield.h>
 #include <linux/prefetch.h>
 #include <linux/ipv6.h>
-#include <rubezh_kdv/include/linux/unaligned.h>
+#include <asm/unaligned.h> //like 6.11.10
 #include <net/ip6_checksum.h>
 #include <net/netdev_queues.h>
 
