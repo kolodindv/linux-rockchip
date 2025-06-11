@@ -783,6 +783,21 @@ int ethtool_virtdev_set_link_ksettings(struct net_device *dev,
 				       const struct ethtool_link_ksettings *cmd,
 				       u32 *dev_speed, u8 *dev_duplex);
 
+/**
+ * struct ethtool_netdev_state - per-netdevice state for ethtool features
+ * @rss_ctx:		XArray of custom RSS contexts
+ * @rss_lock:		Protects entries in @rss_ctx.  May be taken from
+ *			within RTNL.
+ * @wol_enabled:	Wake-on-LAN is enabled
+ * @module_fw_flash_in_progress: Module firmware flashing is in progress.
+ */
+struct ethtool_netdev_state {
+	struct xarray		rss_ctx;
+	struct mutex		rss_lock;
+	unsigned		wol_enabled:1;
+	unsigned		module_fw_flash_in_progress:1;
+};
+
 struct phy_device;
 struct phy_tdr_config;
 
